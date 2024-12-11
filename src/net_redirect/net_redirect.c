@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 #define _POSIX_C_SOURCE 200809L
 
-#include "network_monitor.h"
+#include "net_redirect.h"
 
 #include <arpa/inet.h>
 #include <bpf/bpf.h>
@@ -17,7 +17,13 @@
 #include <time.h>
 #include <unistd.h>
 
-#define INTERFACE       "ens192"
+#define EXIT_OK          0 /* == EXIT_SUCCESS (stdlib.h) man exit(3) */
+#define EXIT_FAIL        1 /* == EXIT_FAILURE (stdlib.h) man exit(3) */
+#define EXIT_FAIL_OPTION 2
+#define EXIT_FAIL_XDP    30
+#define EXIT_FAIL_BPF    40
+
+#define INTERFACE       "veth-xdp"
 #define NANOSEC_PER_SEC 1000000000 /* 10^9 */
 
 struct record
@@ -28,7 +34,7 @@ struct record
 
 struct stats_record
 {
-    struct record stats[1];
+    struct record stats[XDP_ACTION_MAX];
 };
 
 struct sock_info_t
@@ -63,6 +69,101 @@ static double calc_period(struct record *r, struct record *p)
     return period_;
 }
 
+static const char *xdp_action_names[XDP_ACTION_MAX] = {
+    [XDP_ABORTED] = "XDP_ABORTED",   [XDP_DROP] = "XDP_DROP",
+    [XDP_PASS] = "XDP_PASS",         [XDP_TX] = "XDP_TX",
+    [XDP_REDIRECT] = "XDP_REDIRECT", [XDP_UNKNOWN] = "XDP_UNKNOWN",
+};
+
+const char *action2str(__u32 action)
+{
+    if (action < XDP_ACTION_MAX) return xdp_action_names[action];
+    return NULL;
+}
+
+static int __check_map_fd_info(int map_fd, struct bpf_map_info *info,
+                               struct bpf_map_info *exp)
+{
+    __u32 info_len = sizeof(*info);
+    int err;
+
+    if (map_fd < 0) return EXIT_FAIL;
+
+    err = bpf_obj_get_info_by_fd(map_fd, info, &info_len);
+    if (err)
+    {
+        fprintf(stderr, "ERR: %s() can't get info - %s\n", __func__,
+                strerror(errno));
+        return EXIT_FAIL_BPF;
+    }
+
+    if (exp->key_size && exp->key_size != info->key_size)
+    {
+        fprintf(stderr,
+                "ERR: %s() "
+                "Map key size(%d) mismatch expected size(%d)\n",
+                __func__, info->key_size, exp->key_size);
+        return EXIT_FAIL;
+    }
+    if (exp->value_size && exp->value_size != info->value_size)
+    {
+        fprintf(stderr,
+                "ERR: %s() "
+                "Map value size(%d) mismatch expected size(%d)\n",
+                __func__, info->value_size, exp->value_size);
+        return EXIT_FAIL;
+    }
+    if (exp->max_entries && exp->max_entries != info->max_entries)
+    {
+        fprintf(stderr,
+                "ERR: %s() "
+                "Map max_entries(%d) mismatch expected size(%d)\n",
+                __func__, info->max_entries, exp->max_entries);
+        return EXIT_FAIL;
+    }
+    if (exp->type && exp->type != info->type)
+    {
+        fprintf(stderr,
+                "ERR: %s() "
+                "Map type(%d) mismatch expected type(%d)\n",
+                __func__, info->type, exp->type);
+        return EXIT_FAIL;
+    }
+
+    return 0;
+}
+
+int init_socket(struct sock_info_t *sock_info, const char *ip, int port)
+{
+    sock_info->sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock_info->sockfd < 0)
+    {
+        perror("Socket creation failed");
+        return EXIT_FAIL;
+    }
+
+    memset(&sock_info->servaddr, 0, sizeof(sock_info->servaddr));
+    sock_info->servaddr.sin_family = AF_INET;
+    sock_info->servaddr.sin_addr.s_addr = inet_addr(ip);
+    sock_info->servaddr.sin_port = htons(port);
+
+    return EXIT_OK;
+}
+
+void cleanup_socket(struct sock_info_t *sock_info)
+{
+    if (sock_info->sockfd >= 0)
+    {
+        close(sock_info->sockfd);
+    }
+}
+
+static void stats_print_header()
+{
+    /* Print stats "header" */
+    printf("%-12s\n", "XDP-action");
+}
+
 static void stats_print(struct stats_record *stats_rec,
                         struct stats_record *stats_prev,
                         struct sock_info_t *sock_info)
@@ -70,17 +171,20 @@ static void stats_print(struct stats_record *stats_rec,
     struct record *rec, *prev;
     double period, pps, mbps;
     __u64 packets, bytes;
+    int i;
 
+    stats_print_header();
+
+    for (i = 0; i < XDP_ACTION_MAX; i++)
     {
         char *fmt =
-            // "%12s %'11lld pkts (%'10.0f pps)"
-            " %-'11lld pkts (%'10.0f pps)"
+            "%12s %'11lld pkts (%'10.0f pps)"
             " %'11lld Kbytes (%'6.0f Mbits/s)"
             " period:%f\n";
-        // const char *action = "XDP_PASS";
+        const char *action = action2str(i);
 
-        rec = &stats_rec->stats[0];
-        prev = &stats_prev->stats[0];
+        rec = &stats_rec->stats[i];
+        prev = &stats_prev->stats[i];
 
         period = calc_period(rec, prev);
         if (period == 0) return;
@@ -91,11 +195,8 @@ static void stats_print(struct stats_record *stats_rec,
         bytes = rec->total.rx_bytes - prev->total.rx_bytes;
         mbps = (bytes * 8) / period / 1000000;
 
-        // printf(fmt, action, rec->total.rx_packets, pps,
-        //        rec->total.rx_bytes / 1000, bps, period);
-
-        printf(fmt, rec->total.rx_packets, pps, rec->total.rx_bytes / 1000,
-               mbps, period);
+        printf(fmt, action, rec->total.rx_packets, pps,
+               rec->total.rx_bytes / 1000, mbps, period);
 
         snprintf(sock_info->buffer, sizeof(sock_info->buffer),
                  "%'11lld %'10.0f %'11lld %'6.0f", rec->total.rx_packets, pps,
@@ -168,32 +269,10 @@ static bool map_collect(int fd, __u32 map_type, __u32 key, struct record *rec)
 static void stats_collect(int map_fd, __u32 map_type,
                           struct stats_record *stats_rec)
 {
-    __u32 key = XDP_PASS;
-    map_collect(map_fd, map_type, key, &stats_rec->stats[0]);
-}
-
-int init_socket(struct sock_info_t *sock_info, const char *ip, int port)
-{
-    sock_info->sockfd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sock_info->sockfd < 0)
+    __u32 key;
+    for (key = 0; key < XDP_ACTION_MAX; key++)
     {
-        perror("Socket creation failed");
-        return EXIT_FAIL;
-    }
-
-    memset(&sock_info->servaddr, 0, sizeof(sock_info->servaddr));
-    sock_info->servaddr.sin_family = AF_INET;
-    sock_info->servaddr.sin_addr.s_addr = inet_addr(ip);
-    sock_info->servaddr.sin_port = htons(port);
-
-    return EXIT_OK;
-}
-
-void cleanup_socket(struct sock_info_t *sock_info)
-{
-    if (sock_info->sockfd >= 0)
-    {
-        close(sock_info->sockfd);
+        map_collect(map_fd, map_type, key, &stats_rec->stats[key]);
     }
 }
 
@@ -224,58 +303,6 @@ static int stats_poll(int map_fd, __u32 map_type, int interval)
     return EXIT_OK;
 }
 
-static int __check_map_fd_info(int map_fd, struct bpf_map_info *info,
-                               struct bpf_map_info *exp)
-{
-    __u32 info_len = sizeof(*info);
-    int err;
-
-    if (map_fd < 0) return EXIT_FAIL;
-
-    err = bpf_obj_get_info_by_fd(map_fd, info, &info_len);
-    if (err)
-    {
-        fprintf(stderr, "ERR: %s() can't get info - %s\n", __func__,
-                strerror(errno));
-        return EXIT_FAIL_BPF;
-    }
-
-    if (exp->key_size && exp->key_size != info->key_size)
-    {
-        fprintf(stderr,
-                "ERR: %s() "
-                "Map key size(%d) mismatch expected size(%d)\n",
-                __func__, info->key_size, exp->key_size);
-        return EXIT_FAIL;
-    }
-    if (exp->value_size && exp->value_size != info->value_size)
-    {
-        fprintf(stderr,
-                "ERR: %s() "
-                "Map value size(%d) mismatch expected size(%d)\n",
-                __func__, info->value_size, exp->value_size);
-        return EXIT_FAIL;
-    }
-    if (exp->max_entries && exp->max_entries != info->max_entries)
-    {
-        fprintf(stderr,
-                "ERR: %s() "
-                "Map max_entries(%d) mismatch expected size(%d)\n",
-                __func__, info->max_entries, exp->max_entries);
-        return EXIT_FAIL;
-    }
-    if (exp->type && exp->type != info->type)
-    {
-        fprintf(stderr,
-                "ERR: %s() "
-                "Map type(%d) mismatch expected type(%d)\n",
-                __func__, info->type, exp->type);
-        return EXIT_FAIL;
-    }
-
-    return 0;
-}
-
 int main(int argc, char **argv)
 {
     struct bpf_map_info map_expect = {0};
@@ -284,9 +311,9 @@ int main(int argc, char **argv)
     struct bpf_program *prog;
     struct bpf_link *link = NULL;
     int stats_map_fd, err, ifindex;
-    int interval = 2;
+    int interval = 1;
 
-    obj = bpf_object__open_file("network_monitor.bpf.o", NULL);
+    obj = bpf_object__open_file("net_redirect.bpf.o", NULL);
     if (libbpf_get_error(obj))
     {
         fprintf(stderr, "Failed to open BPF object file\n");
@@ -300,7 +327,7 @@ int main(int argc, char **argv)
         goto cleanup;
     }
 
-    prog = bpf_object__find_program_by_name(obj, "xdp_pass");
+    prog = bpf_object__find_program_by_name(obj, "xdp_redirect_func");
     if (!prog)
     {
         fprintf(stderr, "Failed to find eBPF program by name\n");
@@ -310,7 +337,7 @@ int main(int argc, char **argv)
     stats_map_fd = bpf_object__find_map_fd_by_name(obj, "xdp_stats_map");
     if (stats_map_fd < 0)
     {
-        fprintf(stderr, "Failed to get eBPF map\n");
+        fprintf(stderr, "Failed to get eBPF map {xdp_stats_map}.\n");
         goto cleanup;
     }
 
@@ -338,6 +365,47 @@ int main(int argc, char **argv)
         goto cleanup;
     }
 
+    // dnat_map
+    int dnat_map_fd = bpf_object__find_map_fd_by_name(obj, "dnat_map");
+    if (dnat_map_fd < 0)
+    {
+        fprintf(stderr, "Failed to get eBPF map {dnat_map}.\n");
+        goto cleanup;
+    }
+
+    __u32 dst_ip, nat_dst_ip;
+
+    dst_ip = inet_addr("192.168.50.3");
+    nat_dst_ip = inet_addr("172.10.1.2");
+    if (bpf_map_update_elem(dnat_map_fd, &dst_ip, &nat_dst_ip, BPF_ANY) != 0)
+    {
+        perror("bpf_map_update_elem");
+        return 1;
+    }
+
+    printf("dnat map updated successfully.\n");
+
+    // snat_map
+    int snat_map_fd = bpf_object__find_map_fd_by_name(obj, "snat_map");
+    if (snat_map_fd < 0)
+    {
+        fprintf(stderr, "Failed to get eBPF map {snat_map}.\n");
+        goto cleanup;
+    }
+
+    __u32 src_ip, nat_src_ip;
+
+    src_ip = inet_addr("172.10.1.2");
+    nat_src_ip = inet_addr("192.168.50.3");
+    if (bpf_map_update_elem(snat_map_fd, &src_ip, &nat_src_ip, BPF_ANY) != 0)
+    {
+        perror("bpf_map_update_elem");
+        return 1;
+    }
+
+    printf("snat map updated successfully.\n");
+
+    // start mainloop
     stats_poll(stats_map_fd, info.type, interval);
     return EXIT_OK;
 
