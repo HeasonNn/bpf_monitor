@@ -396,7 +396,7 @@ int main(int argc, char **argv)
     __u32 src_ip, nat_src_ip;
 
     src_ip = inet_addr("172.10.1.2");
-    nat_src_ip = inet_addr("192.168.50.3");
+    nat_src_ip = inet_addr("192.168.50.4");
     if (bpf_map_update_elem(snat_map_fd, &src_ip, &nat_src_ip, BPF_ANY) != 0)
     {
         perror("bpf_map_update_elem");
