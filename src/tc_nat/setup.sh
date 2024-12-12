@@ -3,27 +3,24 @@
 # 创建网络命名空间和接口
 create_network() {
     echo "Creating network namespaces..."
-    sudo ip netns add lb
-    sudo ip netns add ns1
-    sudo ip netns add ns2
-    sudo ip netns add ns3
+    for ns in lb ns1 ns2 ns3; do
+        sudo ip netns add "$ns"
+    done
 
     # 创建 veth 对
     echo "Creating veth pairs..."
-    sudo ip link add veth0 type veth peer name veth-bpf
-    sudo ip link add veth1-p type veth peer name veth1
-    sudo ip link add veth2-p type veth peer name veth2
-    sudo ip link add veth3-p type veth peer name veth3
+    sudo ip link add "veth0" type veth peer name "veth-bpf"
+    for i in {1..3}; do
+        sudo ip link add "veth${i}-p" type veth peer name "veth$i"
+    done
 
     # 将 veth 的一端分配到命名空间
     echo "Assigning veth interfaces to namespaces..."
     sudo ip link set veth-bpf netns lb
-    sudo ip link set veth1-p netns lb
-    sudo ip link set veth1 netns ns1
-    sudo ip link set veth2-p netns lb
-    sudo ip link set veth2 netns ns2
-    sudo ip link set veth3-p netns lb
-    sudo ip link set veth3 netns ns3
+    for i in {1..3}; do
+        sudo ip link set "veth${i}-p" netns lb
+        sudo ip link set "veth$i" netns "ns$i"
+    done
 
     # 配置 host 网络接口
     echo "Configuring host network interface..."
@@ -32,39 +29,28 @@ create_network() {
 
     # 配置 lb 网络命名空间
     echo "Configuring 'lb' namespace..."
-    sudo ip netns exec lb ip addr add 192.168.50.3/24 dev veth-bpf
-    sudo ip netns exec lb ip addr add 172.10.1.1/24 dev veth1-p
-    sudo ip netns exec lb ip addr add 172.10.2.1/24 dev veth2-p
-    sudo ip netns exec lb ip addr add 172.10.3.1/24 dev veth3-p
-    sudo ip netns exec lb ip link set veth-bpf up
-    sudo ip netns exec lb ip link set veth1-p up
-    sudo ip netns exec lb ip link set veth2-p up
-    sudo ip netns exec lb ip link set veth3-p up
-    sudo ip netns exec lb ip link set lo up
+    sudo ip netns exec lb bash -c '
+        ip addr add 192.168.50.3/24 dev veth-bpf
+        ip addr add 172.10.1.1/24 dev veth1-p
+        ip addr add 172.10.2.1/24 dev veth2-p
+        ip addr add 172.10.3.1/24 dev veth3-p
+        ip link set veth-bpf up
+        ip link set veth1-p up
+        ip link set veth2-p up
+        ip link set veth3-p up
+        ip link set lo up
+    '
 
-    # 配置 ns1 网络命名空间
-    echo "Configuring 'ns1' namespace..."
-    sudo ip netns exec ns1 ip addr add 172.10.1.2/24 dev veth1
-    sudo ip netns exec ns1 ip link set veth1 up
-    sudo ip netns exec ns1 ip link set lo up
-
-    # 配置 ns2 网络命名空间
-    echo "Configuring 'ns2' namespace..."
-    sudo ip netns exec ns2 ip addr add 172.10.2.2/24 dev veth2
-    sudo ip netns exec ns2 ip link set veth2 up
-    sudo ip netns exec ns2 ip link set lo up
-
-    # 配置 ns3 网络命名空间
-    echo "Configuring 'ns3' namespace..."
-    sudo ip netns exec ns3 ip addr add 172.10.3.2/24 dev veth3
-    sudo ip netns exec ns3 ip link set veth3 up
-    sudo ip netns exec ns3 ip link set lo up
-
-    # 配置路由
-    echo "Configuring routes for namespaces..."
-    sudo ip netns exec ns1 ip route add default via 172.10.1.1
-    sudo ip netns exec ns2 ip route add default via 172.10.2.1
-    sudo ip netns exec ns3 ip route add default via 172.10.3.1
+    # 配置网络命名空间
+    for i in {1..3}; do
+        echo "Configuring 'ns$i' namespace..."
+        sudo ip netns exec "ns$i" bash -c "
+            ip addr add 172.10.$i.2/24 dev veth$i
+            ip link set veth$i up
+            ip link set lo up
+            ip route add default via 172.10.$i.1
+        "
+    done
 
     echo "Network setup completed successfully."
 }
@@ -72,19 +58,15 @@ create_network() {
 # 删除网络命名空间和接口
 delete_network() {
     echo "Deleting network namespaces..."
-
-    # 删除命名空间和接口
-    sudo ip netns del lb &> /dev/null
-    sudo ip netns del ns1 &> /dev/null
-    sudo ip netns del ns2 &> /dev/null
-    sudo ip netns del ns3 &> /dev/null
+    for ns in lb ns1 ns2 ns3; do
+        sudo ip netns del "$ns" &> /dev/null
+    done
 
     # 删除 veth 接口
     echo "Deleting veth pairs..."
-    sudo ip link delete veth0 &> /dev/null
-    sudo ip link delete veth1-p &> /dev/null
-    sudo ip link delete veth2-p &> /dev/null
-    sudo ip link delete veth3-p &> /dev/null
+    for i in {0..3}; do
+        sudo ip link delete "veth$i" &> /dev/null
+    done
 
     echo "Network setup deleted successfully."
 }

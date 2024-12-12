@@ -55,7 +55,7 @@ static __u64 gettime(void)
     struct timespec t;
     if (clock_gettime(CLOCK_MONOTONIC, &t) < 0)
     {
-        perror("Error with gettimeofday");
+        perror("Error with clock_gettime");
         exit(EXIT_FAIL);
     }
     return (__u64)t.tv_sec * NANOSEC_PER_SEC + t.tv_nsec;
@@ -133,11 +133,10 @@ static void stats_print(struct stats_record *stats_rec,
     struct record *rec, *prev;
     double period, pps, mbps;
     __u64 packets, bytes;
-    int i;
 
     stats_print_header();
 
-    for (i = 0; i < ACTION_MAX; i++)
+    for (int i = 0; i < ACTION_MAX; i++)
     {
         const char *action = action2str(i);
         char *fmt =
@@ -172,7 +171,7 @@ static void stats_print(struct stats_record *stats_rec,
 /* BPF_MAP_TYPE_ARRAY */
 void map_get_value_array(int fd, __u32 key, struct datarec *value)
 {
-    if ((bpf_map_lookup_elem(fd, &key, value)) != 0)
+    if (bpf_map_lookup_elem(fd, &key, value) != 0)
     {
         fprintf(stderr, "ERR: bpf_map_lookup_elem failed key:0x%X\n", key);
     }
@@ -185,15 +184,14 @@ void map_get_value_percpu_array(int fd, __u32 key, struct datarec *value)
     struct datarec values[nr_cpus];
     __u64 sum_bytes = 0;
     __u64 sum_pkts = 0;
-    int i;
 
-    if ((bpf_map_lookup_elem(fd, &key, values)) != 0)
+    if (bpf_map_lookup_elem(fd, &key, values) != 0)
     {
         fprintf(stderr, "ERR: bpf_map_lookup_elem failed key:0x%X\n", key);
         return;
     }
 
-    for (i = 0; i < nr_cpus; i++)
+    for (unsigned int i = 0; i < nr_cpus; i++)
     {
         sum_pkts += values[i].rx_packets;
         sum_bytes += values[i].rx_bytes;
@@ -223,18 +221,16 @@ static bool map_collect(int fd, __u32 map_type, __u32 key, struct record *rec)
             break;
     }
 
-    rec->total.rx_packets = value.rx_packets;
-    rec->total.rx_bytes = value.rx_bytes;
+    rec->total = value;
     return true;
 }
 
-static void stats_collect(int map_fd, __u32 map_type,
+static void stats_collect(int fd, __u32 map_type,
                           struct stats_record *stats_rec)
 {
-    __u32 key;
-    for (key = 0; key < ACTION_MAX; key++)
+    for (__u32 key = 0; key < ACTION_MAX; key++)
     {
-        map_collect(map_fd, map_type, key, &stats_rec->stats[key]);
+        map_collect(fd, map_type, key, &stats_rec->stats[key]);
     }
 }
 
@@ -249,7 +245,6 @@ static int stats_poll(int map_fd, __u32 map_type, int interval)
     }
 
     setlocale(LC_NUMERIC, "en_US");
-
     stats_collect(map_fd, map_type, &record);
     sleep(1);
 
@@ -267,26 +262,26 @@ static int stats_poll(int map_fd, __u32 map_type, int interval)
 
 int tc_cmd_add_clsact(const char *ifname)
 {
-    // 尝试添加 clsact
     char cmd[256];
     snprintf(cmd, sizeof(cmd), "tc qdisc add dev %s clsact", ifname);
     int ret = system(cmd);
-    if (ret != 0)
+    if (ret != 0 &&
+        WEXITSTATUS(ret) != 1)  // Allow exit status 1 for existing clsact
     {
-        // clsact 可能已存在，检查是否存在
         snprintf(cmd, sizeof(cmd), "tc qdisc show dev %s | grep clsact",
                  ifname);
         ret = system(cmd);
-        if (ret != 0)
-        {  // clsact 不存在，添加失败
+        if (ret != 0)  // clsact does not exist
+        {
             return -1;
         }
     }
     return 0;
 }
 
-int update_map(const char *map_name, struct bpf_object *obj, __u32 key,
-               __u32 value)
+int update_nat_map(const char *map_name, struct bpf_object *obj,
+                   const char *src_ip, __u16 src_port, __u8 protocol,
+                   const char *dst_ip, __u16 dst_port)
 {
     int map_fd = bpf_object__find_map_fd_by_name(obj, map_name);
     if (map_fd < 0)
@@ -295,13 +290,25 @@ int update_map(const char *map_name, struct bpf_object *obj, __u32 key,
         return EXIT_FAIL;
     }
 
+    struct nat_key_t key = {
+        .ip = inet_addr(src_ip),
+        .port = htons(src_port),
+        .protocol = protocol,
+    };
+
+    struct nat_value_t value = {
+        .ip = inet_addr(dst_ip),
+        .port = htons(dst_port),
+    };
+
     if (bpf_map_update_elem(map_fd, &key, &value, BPF_ANY) != 0)
     {
         perror("bpf_map_update_elem");
         return EXIT_FAIL;
     }
 
-    printf("%s map updated successfully.\n", map_name);
+    printf("NAT map {%s} updated successfully: %s:%u -> %s:%u (protocol: %u)\n",
+           map_name, src_ip, src_port, dst_ip, dst_port, protocol);
     return EXIT_OK;
 }
 
@@ -310,8 +317,6 @@ void cleanup_tc_hook(struct bpf_tc_hook *tc_hook, struct bpf_tc_opts *tc_opts,
 {
     if (hook_created)
     {
-        tc_opts->flags = tc_opts->prog_fd = tc_opts->prog_id = 0;
-
         int err = bpf_tc_detach(tc_hook, tc_opts);
         if (err)
         {
@@ -321,8 +326,8 @@ void cleanup_tc_hook(struct bpf_tc_hook *tc_hook, struct bpf_tc_opts *tc_opts,
         {
             printf("Detached TC hook\n");
         }
-
         bpf_tc_hook_destroy(tc_hook);
+        memset(tc_opts, 0, sizeof(*tc_opts));  // Clean up tc_opts as well
     }
 }
 
@@ -337,15 +342,13 @@ int main(int argc, char **argv)
     struct bpf_object *obj;
     int stats_map_fd, err = 0, ifindex;
     int interval = 1;
-    bool ig_hook_created = false;
-    bool eg_hook_created = false;
+    bool ig_hook_created = false, eg_hook_created = false;
 
     struct bpf_map_info map_expect = {0};
     struct bpf_map_info info = {0};
 
     if (signal(SIGINT, sig_int) == SIG_ERR)
     {
-        err = errno;
         fprintf(stderr, "Can't set signal handler: %s\n", strerror(errno));
         return EXIT_FAIL;
     }
@@ -373,7 +376,7 @@ int main(int argc, char **argv)
         goto cleanup;
     }
 
-    // -------------------------------------------dnat-----------------------------------------
+    // Add DNAT program
     struct bpf_program *tc_dnat_prog =
         bpf_object__find_program_by_name(obj, "tc_dnat_func");
     if (!tc_dnat_prog)
@@ -395,24 +398,19 @@ int main(int argc, char **argv)
     DECLARE_LIBBPF_OPTS(bpf_tc_opts, tc_ig_opts, .handle = INGRESS_HANDLE,
                         .priority = 1, .prog_fd = tc_dnat_prog_fd);
 
-    err = bpf_tc_hook_create(&tc_ig_hook);
-    if (err && err != -EEXIST)
+    if ((err = bpf_tc_hook_create(&tc_ig_hook)) && err != -EEXIST)
     {
         fprintf(stderr, "Failed to create ingress TC hook: %d\n", err);
         goto cleanup;
     }
-
     ig_hook_created = true;
-
-    err = bpf_tc_attach(&tc_ig_hook, &tc_ig_opts);
-    if (err)
+    if ((err = bpf_tc_attach(&tc_ig_hook, &tc_ig_opts)))
     {
         fprintf(stderr, "Failed to attach ingress TC: %d\n", err);
         goto cleanup;
     }
-    // -----------------------------------------------------------------------------------------
 
-    // -------------------------------------------snat------------------------------------------
+    // Add SNAT program
     struct bpf_program *tc_snat_prog =
         bpf_object__find_program_by_name(obj, "tc_snat_func");
     if (!tc_snat_prog)
@@ -434,31 +432,28 @@ int main(int argc, char **argv)
     DECLARE_LIBBPF_OPTS(bpf_tc_opts, tc_eg_opts, .handle = EGRESS_HANDLE,
                         .priority = 1, .prog_fd = tc_snat_prog_fd);
 
-    err = bpf_tc_hook_create(&tc_eg_hook);
-    if (err && err != -EEXIST)
+    if ((err = bpf_tc_hook_create(&tc_eg_hook)) && err != -EEXIST)
     {
         fprintf(stderr, "Failed to create egress TC hook: %d\n", err);
         goto cleanup;
     }
-
     eg_hook_created = true;
 
-    err = bpf_tc_attach(&tc_eg_hook, &tc_eg_opts);
-    if (err)
+    if ((err = bpf_tc_attach(&tc_eg_hook, &tc_eg_opts)))
     {
         fprintf(stderr, "Failed to attach egress TC: %d\n", err);
         goto cleanup;
     }
-    // -----------------------------------------------------------------------------------------
 
     printf("Successfully attached ingress and egress TC hooks to %s\n",
            INTERFACE);
 
-    if ((err = update_map("dnat_map", obj, inet_addr("192.168.50.3"),
-                          inet_addr("172.10.1.2"))) < 0)
+    if ((err = update_nat_map("dnat_map", obj, "192.168.50.3", 80, IPPROTO_TCP,
+                              "172.10.1.2", 5173)) < 0)
         goto cleanup;
-    if ((err = update_map("snat_map", obj, inet_addr("172.10.1.2"),
-                          inet_addr("192.168.50.3"))) < 0)
+
+    if ((err = update_nat_map("snat_map", obj, "172.10.1.2", 5173, IPPROTO_TCP,
+                              "192.168.50.3", 80)) < 0)
         goto cleanup;
 
     stats_map_fd = bpf_object__find_map_fd_by_name(obj, "tc_stats_map");
@@ -471,14 +466,13 @@ int main(int argc, char **argv)
     map_expect.key_size = sizeof(__u32);
     map_expect.value_size = sizeof(struct datarec);
     map_expect.max_entries = ACTION_MAX;
-    err = check_map_fd_info(stats_map_fd, &info, &map_expect);
-    if (err)
+    if ((err = check_map_fd_info(stats_map_fd, &info, &map_expect)))
     {
         fprintf(stderr, "ERR: map via FD not compatible\n");
         goto cleanup;
     }
 
-    // start mainloop
+    // Start main loop
     stats_poll(stats_map_fd, info.type, interval);
 
     printf("Received interrupt signal, cleaning up...\n");
@@ -492,5 +486,6 @@ cleanup:
         bpf_object__close(obj);
         printf("Closed BPF object\n");
     }
+
     return err < 0 ? EXIT_FAIL : EXIT_OK;
 }
