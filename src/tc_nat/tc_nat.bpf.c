@@ -10,6 +10,16 @@
 
 #define TC_ACT_OK 0
 
+#define TCP_DST_OFF \
+    (ETH_HLEN + sizeof(struct iphdr) + offsetof(struct tcphdr, dest))
+#define TCP_SRC_OFF \
+    (ETH_HLEN + sizeof(struct iphdr) + offsetof(struct tcphdr, source))
+#define IP_SRC_OFF  (ETH_HLEN + offsetof(struct iphdr, saddr))
+#define IP_DST_OFF  (ETH_HLEN + offsetof(struct iphdr, daddr))
+#define IP_CSUM_OFF (ETH_HLEN + offsetof(struct iphdr, check))
+#define TCP_CSUM_OFF \
+    (ETH_HLEN + sizeof(struct iphdr) + offsetof(struct tcphdr, check))
+
 struct
 {
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
@@ -57,14 +67,17 @@ static __always_inline __u32 tc_stats_record_action(struct __sk_buff *skb,
     return TC_ACT_OK;
 }
 
-static __always_inline int process_packet(struct __sk_buff *skb, int is_dnat)
+SEC("tc")
+int tc_dnat_func(struct __sk_buff *skb)
 {
     void *data = (void *)(long)skb->data;
     void *data_end = (void *)(long)skb->data_end;
+    int action = DEFAULT;
 
     struct ethhdr *eth = data;
-    if ((void *)(eth + 1) > data_end || eth->h_proto != htons(ETH_P_IP))
-        return DEFAULT;
+    if ((void *)(eth + 1) > data_end) return DEFAULT;
+
+    if (eth->h_proto != htons(ETH_P_IP)) return DEFAULT;
 
     struct iphdr *ip = data + sizeof(struct ethhdr);
     if ((void *)(ip + 1) > data_end) return DEFAULT;
@@ -72,90 +85,106 @@ static __always_inline int process_packet(struct __sk_buff *skb, int is_dnat)
     __u8 protocol = ip->protocol;
     if (protocol != IPPROTO_TCP && protocol != IPPROTO_UDP) return DEFAULT;
 
-    __u32 old_ip = is_dnat ? ip->daddr : ip->saddr;
+    __u32 old_dst_ip = ip->daddr;
     __u16 original_checksum = ip->check;
-    __u16 old_port = 0;
 
+    __u16 old_dst_port = 0;
     if (protocol == IPPROTO_TCP)
     {
         struct tcphdr *tcp = (struct tcphdr *)(ip + 1);
         if ((void *)(tcp + 1) > data_end) return DEFAULT;
-        old_port = is_dnat ? tcp->dest : tcp->source;
+        old_dst_port = tcp->dest;
     }
-    else
+    else if (protocol == IPPROTO_UDP)
     {
         struct udphdr *udp = (struct udphdr *)(ip + 1);
         if ((void *)(udp + 1) > data_end) return DEFAULT;
-        old_port = is_dnat ? udp->dest : udp->source;
+        old_dst_port = udp->dest;
     }
 
-    struct nat_key_t key = {
-        .ip = old_ip,
-        .port = old_port,
+    struct nat_key_t dnat_key = {
+        .ip = old_dst_ip,
+        .port = old_dst_port,
         .protocol = protocol,
     };
 
-    struct nat_value_t *value = is_dnat ? bpf_map_lookup_elem(&dnat_map, &key)
-                                        : bpf_map_lookup_elem(&snat_map, &key);
-    if (value)
+    struct nat_value_t *dnat_value = bpf_map_lookup_elem(&dnat_map, &dnat_key);
+    if (dnat_value)
     {
-        if (is_dnat)
-        {
-            ip->daddr = value->ip;
-        }
-        else
-        {
-            ip->saddr = value->ip;
-        }
-
-        ip->check = update_checksum(original_checksum, (__u16)(old_ip >> 16),
-                                    (__u16)(value->ip >> 16));
-        ip->check = update_checksum(ip->check, (__u16)(old_ip & 0xFFFF),
-                                    (__u16)(value->ip & 0xFFFF));
-
         if (protocol == IPPROTO_TCP)
         {
-            struct tcphdr *tcp = (struct tcphdr *)(ip + 1);
-            __u16 old_checksum = tcp->check;
-            if (is_dnat)
-            {
-                tcp->dest = value->port;
-            }
-            else
-            {
-                tcp->source = value->port;
-            }
-            tcp->check = update_checksum(old_checksum, old_port,
-                                         is_dnat ? value->port : value->port);
-        }
-        else
-        {
-            struct udphdr *udp = (struct udphdr *)(ip + 1);
-            __u16 old_checksum = udp->check;
-            if (is_dnat)
-            {
-                udp->dest = value->port;
-            }
-            else
-            {
-                udp->source = value->port;
-            }
-            udp->check = update_checksum(old_checksum, old_port,
-                                         is_dnat ? value->port : value->port);
-        }
-        return is_dnat ? DNAT : SNAT;
-    }
-    return DEFAULT;
-}
+            bpf_skb_store_bytes(skb, IP_DST_OFF, &dnat_value->ip, sizeof(dnat_value->ip), BPF_F_RECOMPUTE_CSUM);
+            bpf_l3_csum_replace(skb, IP_CSUM_OFF, old_dst_ip, dnat_value->ip, sizeof(dnat_value->ip));
 
-SEC("tc")
-int tc_dnat_func(struct __sk_buff *skb)
-{
-    return tc_stats_record_action(skb, process_packet(skb, 1));
+            bpf_skb_store_bytes(skb, TCP_DST_OFF, &dnat_value->port, sizeof(dnat_value->port), BPF_F_RECOMPUTE_CSUM);
+            bpf_l4_csum_replace(skb, TCP_CSUM_OFF, old_dst_ip, dnat_value->ip, sizeof(dnat_value->ip) | BPF_F_PSEUDO_HDR);
+            bpf_l4_csum_replace(skb, TCP_CSUM_OFF, old_dst_port, dnat_value->port, sizeof(dnat_value->port));
+        }
+        action = DNAT;
+    }
+    return tc_stats_record_action(skb, action);
 }
 
 SEC("tc")
 int tc_snat_func(struct __sk_buff *skb)
 {
-    return tc_stats_record_action(skb, process_packet(skb, 0));
+    void *data = (void *)(long)skb->data;
+    void *data_end = (void *)(long)skb->data_end;
+    int action = DEFAULT;
+
+    struct ethhdr *eth = data;
+    if ((void *)(eth + 1) > data_end) goto out;
+
+    if (eth->h_proto != htons(ETH_P_IP)) goto out;
+
+    struct iphdr *ip = data + sizeof(struct ethhdr);
+    if ((void *)(ip + 1) > data_end) goto out;
+
+    __u8 protocol = ip->protocol;
+    if (protocol != IPPROTO_TCP && protocol != IPPROTO_UDP) goto out;
+
+    __u32 old_src_ip = ip->saddr;
+    __u16 original_checksum = ip->check;
+
+    __u16 old_src_port = 0;
+    if (protocol == IPPROTO_TCP)
+    {
+        struct tcphdr *tcp = (void *)ip + (ip->ihl * 4);
+        if ((void *)tcp + sizeof(struct tcphdr) > data_end) goto out;
+        old_src_port = tcp->source;
+    }
+    else
+    {
+        goto out;
+    }
+
+    struct nat_key_t snat_key = {
+        .ip = old_src_ip,
+        .port = old_src_port,
+        .protocol = protocol,
+    };
+
+    struct nat_value_t *snat_value = bpf_map_lookup_elem(&snat_map, &snat_key);
+    if (snat_value)
+    {
+        if (protocol == IPPROTO_TCP)
+        {
+            bpf_skb_store_bytes(skb, IP_SRC_OFF, &snat_value->ip, sizeof(snat_value->ip), BPF_F_RECOMPUTE_CSUM);
+            bpf_l3_csum_replace(skb, IP_CSUM_OFF, old_src_ip, snat_value->ip, sizeof(snat_value->ip));
+
+            bpf_skb_store_bytes(skb, TCP_SRC_OFF, &snat_value->port, sizeof(snat_value->port), BPF_F_RECOMPUTE_CSUM);
+            bpf_l4_csum_replace(skb, TCP_CSUM_OFF, old_src_ip, snat_value->ip, sizeof(snat_value->ip) | BPF_F_PSEUDO_HDR);
+            bpf_l4_csum_replace(skb, TCP_CSUM_OFF, old_src_ip, snat_value->port, sizeof(snat_value->port));
+        }
+        action = SNAT;
+    }
+    else
+    {
+        bpf_printk("SNAT miss");
+    }
+
+out:
+    return tc_stats_record_action(skb, action);
 }
+
+char _license[] SEC("license") = "GPL";

@@ -24,7 +24,6 @@
 #define EXIT_FAIL_XDP    30
 #define EXIT_FAIL_BPF    40
 
-#define INTERFACE       "veth-bpf"
 #define NANOSEC_PER_SEC 1000000000 /* 10^9 */
 
 #define INGRESS_HANDLE 1
@@ -339,6 +338,14 @@ static void sig_int(int signo)
 
 int main(int argc, char **argv)
 {
+    if (argc < 2) 
+    {
+        printf("Usage: ./tc_nat [dev_name] \n");
+        printf("eg:    ./tc_nat ens34 \n");
+        return EXIT_FAIL;
+    }
+    
+    char *dev_name = argv[1];
     struct bpf_object *obj;
     int stats_map_fd, err = 0, ifindex;
     int interval = 1;
@@ -367,9 +374,9 @@ int main(int argc, char **argv)
         goto cleanup;
     }
 
-    ifindex = if_nametoindex(INTERFACE);
+    ifindex = if_nametoindex(dev_name);
 
-    err = tc_cmd_add_clsact(INTERFACE);
+    err = tc_cmd_add_clsact(dev_name);
     if (err && err != -EEXIST)
     {
         fprintf(stderr, "Failed to add clsact qdisc: %d\n", err);
@@ -446,14 +453,14 @@ int main(int argc, char **argv)
     }
 
     printf("Successfully attached ingress and egress TC hooks to %s\n",
-           INTERFACE);
+           dev_name);
 
-    if ((err = update_nat_map("dnat_map", obj, "192.168.50.3", 80, IPPROTO_TCP,
-                              "172.10.1.2", 5173)) < 0)
+    if ((err = update_nat_map("dnat_map", obj, "10.177.53.174", 80, IPPROTO_TCP,
+                              "172.10.1.2", 80)) < 0)
         goto cleanup;
 
-    if ((err = update_nat_map("snat_map", obj, "172.10.1.2", 5173, IPPROTO_TCP,
-                              "192.168.50.3", 80)) < 0)
+    if ((err = update_nat_map("snat_map", obj, "172.10.1.2", 80, IPPROTO_TCP,
+                              "10.177.53.174", 80)) < 0)
         goto cleanup;
 
     stats_map_fd = bpf_object__find_map_fd_by_name(obj, "tc_stats_map");
