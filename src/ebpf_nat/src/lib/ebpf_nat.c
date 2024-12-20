@@ -3,7 +3,20 @@
 
 #include "../include/ebpf_nat.h"
 
+#define DECLARE_LIBBPF_OPTS_LOCAL(TYPE, VAR, ...) \
+    do                                            \
+    {                                             \
+        memset(&(VAR), 0, sizeof(struct TYPE));   \
+        (VAR).sz = sizeof(struct TYPE);           \
+        __VA_ARGS__;                              \
+    } while (0)
+
 volatile sig_atomic_t exiting = 0;
+
+static bool ig_hook_created = 0, eg_hook_created = 0;
+struct bpf_tc_hook tc_ig_hook, tc_eg_hook;
+struct bpf_tc_opts tc_ig_opts, tc_eg_opts;
+struct bpf_object *obj;
 
 const char *action_names[ACTION_MAX] = {
     [DEFAULT] = "DEFAULT",
@@ -58,13 +71,58 @@ bool stats_map_collect(int fd, __u32 map_type, __u32 key, struct record *rec)
     return true;
 }
 
-void stats_collect(int fd, __u32 map_type,
-                          struct stats_record *stats_rec)
+void stats_collect(int fd, __u32 map_type, struct stats_record *stats_rec)
 {
     for (__u32 key = 0; key < ACTION_MAX; key++)
     {
         stats_map_collect(fd, map_type, key, &stats_rec->stats[key]);
     }
+}
+
+int stats_poll_init(stats_context_t *ctx)
+{
+    struct bpf_map_info info = {0};
+
+    int stats_map_fd = bpf_object__find_map_fd_by_name(obj, "ebpf_stats_map");
+    if (stats_map_fd < 0)
+    {
+        fprintf(stderr, "Failed to get eBPF map {ebpf_stats_map}.\n");
+        cleanup_tc_hook();
+        return EXIT_FAIL;
+    }
+
+    if (bpf_validate_map_info(stats_map_fd, &info,
+                              &(struct bpf_map_info){
+                                  .key_size = sizeof(__u32),
+                                  .value_size = sizeof(struct datarec),
+                                  .max_entries = ACTION_MAX,
+                              }))
+    {
+        cleanup_tc_hook();
+        return EXIT_FAIL;
+    }
+
+    ctx->map_fd = stats_map_fd;
+    ctx->map_type = info.type;
+    ctx->initialized = 0;
+    return EXIT_OK;
+}
+
+int stats_poll_step(stats_context_t *ctx)
+{
+    if (!ctx->initialized)
+    {
+        stats_collect(ctx->map_fd, ctx->map_type, &ctx->record);
+        ctx->initialized = 1;
+        return EXIT_OK;
+    }
+
+    ctx->prev = ctx->record;
+    stats_collect(ctx->map_fd, ctx->map_type, &ctx->record);
+
+    stats_print(&ctx->record, &ctx->prev);
+
+    return EXIT_OK;
 }
 
 int stats_poll(int map_fd, __u32 map_type, int interval)
@@ -88,7 +146,7 @@ int stats_poll(int map_fd, __u32 map_type, int interval)
 void stats_print_header() { printf("%-12s\n", "action"); };
 
 void stats_print(struct stats_record *stats_rec,
-                        struct stats_record *stats_prev)
+                 struct stats_record *stats_prev)
 {
     struct record *rec, *prev;
     double period, pps, mbps;
@@ -161,7 +219,7 @@ int bpf_validate_map(struct bpf_object *obj, const char *map_name)
 }
 
 int bpf_validate_map_info(int map_fd, struct bpf_map_info *info,
-                             struct bpf_map_info *exp)
+                          struct bpf_map_info *exp)
 {
     __u32 info_len = sizeof(*info);
     if (map_fd < 0) return EXIT_FAIL;
@@ -215,8 +273,8 @@ void bpf_map_get_value_percpu_array(int fd, __u32 key, struct datarec *value)
 }
 
 int net_update_nat_map(const char *map_name, struct bpf_object *obj,
-                          const char *src_ip, __u16 src_port, __u8 protocol,
-                          const char *dst_ip, __u16 dst_port)
+                       const char *src_ip, __u16 src_port, __u8 protocol,
+                       const char *dst_ip, __u16 dst_port)
 {
     int map_fd = bpf_object__find_map_fd_by_name(obj, map_name);
     if (map_fd < 0)
@@ -252,8 +310,7 @@ int net_add_clsact_qdisc(const char *ifname)
     char cmd[256];
     snprintf(cmd, sizeof(cmd), "tc qdisc add dev %s clsact", ifname);
     int ret = system(cmd);
-    if (ret != 0 &&
-        WEXITSTATUS(ret) != 1)
+    if (ret != 0 && WEXITSTATUS(ret) != 1)
     {
         snprintf(cmd, sizeof(cmd), "tc qdisc show dev %s | grep clsact",
                  ifname);
@@ -266,69 +323,62 @@ int net_add_clsact_qdisc(const char *ifname)
     return 0;
 }
 
-void net_cleanup_tc_hooks(struct bpf_tc_hook *tc_hook,
-                            struct bpf_tc_opts *tc_opts, bool hook_created)
-{
-    if (hook_created)
-    {
-        int err = bpf_tc_detach(tc_hook, tc_opts);
-        if (err)
-        {
-            fprintf(stderr, "Failed to detach TC hook: %d\n", err);
-        }
-        else
-        {
-            printf("Detached TC hook\n");
-        }
-        bpf_tc_hook_destroy(tc_hook);
-        memset(tc_opts, 0, sizeof(*tc_opts));
-    }
-}
-
 int net_update_nat_mapping_if_needed(struct bpf_object *obj)
 {
     int err = 0;
 
     err = net_update_nat_map("dnat_map", obj, "10.177.53.174", 80, IPPROTO_TCP,
-                         "172.200.42.80", 9050);
+                             "172.200.42.80", 9050);
     if (err < 0)
     {
         return EXIT_FAIL;
     }
 
-    err = net_update_nat_map("snat_map", obj, "172.200.42.80", 9050, IPPROTO_TCP,
-                         "10.177.53.174", 80);
+    err = net_update_nat_map("snat_map", obj, "172.200.42.80", 9050,
+                             IPPROTO_TCP, "10.177.53.174", 80);
     return err < 0 ? EXIT_FAIL : EXIT_OK;
 }
 
-void cleanup_tc_hook(struct bpf_tc_hook *tc_hook, struct bpf_tc_opts *tc_opts,
-                     bool hook_created)
+void cleanup_tc_hook()
 {
-    if (hook_created)
+    int err = 0;
+    printf("Cleaning up...\n");
+
+    if (ig_hook_created)
     {
-        int err = bpf_tc_detach(tc_hook, tc_opts);
-        if (err)
+        err = bpf_tc_detach(&tc_ig_hook, &tc_ig_opts);
+        if (err < 0 && err != -ENOENT)
         {
-            fprintf(stderr, "Failed to detach TC hook: %d\n", err);
+            fprintf(stderr, "Failed to detach ingress TC hook\n");
         }
-        else
+
+        bpf_tc_hook_destroy(&tc_ig_hook);
+        memset(&tc_ig_opts, 0, sizeof(tc_ig_opts));
+    }
+
+    if (eg_hook_created)
+    {
+        err = bpf_tc_detach(&tc_eg_hook, &tc_eg_opts);
+        if (err < 0 && err != -ENOENT)
         {
-            printf("Detached TC hook\n");
+            fprintf(stderr, "Failed to detach egress TC hook\n");
         }
-        bpf_tc_hook_destroy(tc_hook);
-        memset(tc_opts, 0, sizeof(*tc_opts));
+
+        bpf_tc_hook_destroy(&tc_eg_hook);
+        memset(&tc_eg_opts, 0, sizeof(tc_eg_opts));
+    }
+
+    if (obj)
+    {
+        bpf_object__close(obj);
+        printf("Closed BPF object\n");
+        obj = NULL;
     }
 }
 
-int run_ebpf_nat(const char *dev_name)
+int init_ebpf_nat(const char *dev_name)
 {
-    struct bpf_object *obj;
-    struct bpf_map_info info = {0};
-    int err = 0, stats_map_fd = -1, ifindex;
-    int interval = 2;
-    bool ig_hook_created = false, eg_hook_created = false;
-    
-    exiting = 0;
+    int err = 0, ifindex;
 
     ifindex = if_nametoindex(dev_name);
     if (ifindex == 0)
@@ -354,10 +404,12 @@ int run_ebpf_nat(const char *dev_name)
         return EXIT_FAIL;
     }
 
-    DECLARE_LIBBPF_OPTS(bpf_tc_hook, tc_ig_hook, .ifindex = ifindex,
-                        .attach_point = BPF_TC_INGRESS);
-    DECLARE_LIBBPF_OPTS(bpf_tc_opts, tc_ig_opts, .handle = INGRESS_HANDLE,
-                        .priority = 1, .prog_fd = ebpf_dnat_prog_fd);
+    DECLARE_LIBBPF_OPTS_LOCAL(bpf_tc_hook, tc_ig_hook,
+                              tc_ig_hook.ifindex = ifindex,
+                              tc_ig_hook.attach_point = BPF_TC_INGRESS);
+    DECLARE_LIBBPF_OPTS_LOCAL(
+        bpf_tc_opts, tc_ig_opts, tc_ig_opts.handle = INGRESS_HANDLE,
+        tc_ig_opts.priority = 1, tc_ig_opts.prog_fd = ebpf_dnat_prog_fd);
 
     if ((err = bpf_tc_hook_create(&tc_ig_hook)) && err != -EEXIST)
     {
@@ -387,10 +439,12 @@ int run_ebpf_nat(const char *dev_name)
         return EXIT_FAIL;
     }
 
-    DECLARE_LIBBPF_OPTS(bpf_tc_hook, tc_eg_hook, .ifindex = ifindex,
-                        .attach_point = BPF_TC_EGRESS);
-    DECLARE_LIBBPF_OPTS(bpf_tc_opts, tc_eg_opts, .handle = EGRESS_HANDLE,
-                        .priority = 1, .prog_fd = ebpf_snat_prog_fd);
+    DECLARE_LIBBPF_OPTS_LOCAL(bpf_tc_hook, tc_eg_hook,
+                              tc_eg_hook.ifindex = ifindex,
+                              tc_eg_hook.attach_point = BPF_TC_EGRESS);
+    DECLARE_LIBBPF_OPTS_LOCAL(
+        bpf_tc_opts, tc_eg_opts, tc_eg_opts.handle = EGRESS_HANDLE,
+        tc_eg_opts.priority = 1, tc_eg_opts.prog_fd = ebpf_snat_prog_fd);
 
     if ((err = bpf_tc_hook_create(&tc_eg_hook)) && err != -EEXIST)
     {
@@ -407,39 +461,11 @@ int run_ebpf_nat(const char *dev_name)
 
     printf("Successfully attached ingress and egress TC hooks\n");
 
-    if (net_update_nat_mapping_if_needed(obj)) goto cleanup;
-
-    stats_map_fd = bpf_object__find_map_fd_by_name(obj, "ebpf_stats_map");
-    if (stats_map_fd < 0)
+    if (net_update_nat_mapping_if_needed(obj))
     {
-        fprintf(stderr, "Failed to get eBPF map {ebpf_stats_map}.\n");
-        goto cleanup;
+        cleanup_tc_hook();
+        return EXIT_FAIL;
     }
 
-    if (bpf_validate_map_info(stats_map_fd, &info,
-                          &(struct bpf_map_info){
-                              .key_size = sizeof(__u32),
-                              .value_size = sizeof(struct datarec),
-                              .max_entries = ACTION_MAX,
-                          }))
-    {
-        goto cleanup;
-    }
-
-    if (stats_poll(stats_map_fd, info.type, interval))
-    {
-        goto cleanup;
-    }
-
-    printf("Received interrupt signal, cleaning up...\n");
-
-cleanup:
-    cleanup_tc_hook(&tc_ig_hook, &tc_ig_opts, ig_hook_created);
-    cleanup_tc_hook(&tc_eg_hook, &tc_eg_opts, eg_hook_created);
-    if (obj)
-    {
-        bpf_object__close(obj);
-        printf("Closed BPF object\n");
-    }
-    return err < 0 ? EXIT_FAIL : EXIT_OK;
+    return EXIT_OK;
 }

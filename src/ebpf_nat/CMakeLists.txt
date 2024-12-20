@@ -1,5 +1,6 @@
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(LIBBPF REQUIRED libbpf)
+pkg_check_modules(LIBBPF REQUIRED libbpf)
 
 set(SRC_DIR ${CMAKE_SOURCE_DIR}/src/ebpf_nat/src)
 set(BPF_SRC ${SRC_DIR}/bpf/ebpf_nat.bpf.c)
@@ -21,7 +22,10 @@ include_directories(
     ${LIBBPF_INCLUDE_DIRS}
 )
 
-file(GLOB LIB_SOURCES ${SRC_DIR}/lib/*.c)
+set(LIB_SOURCES 
+    ${SRC_DIR}/lib/ebpf_nat.c
+    ${SRC_DIR}/lib/event_handler.c
+)
 
 add_library(mylib STATIC ${LIB_SOURCES})
 
@@ -33,7 +37,7 @@ add_dependencies(ebpf_nat mylib)
 target_link_libraries(mylib PRIVATE ${LIBBPF_LIBRARIES})
 target_link_options(mylib PRIVATE ${LIBBPF_LDFLAGS})
 
-target_link_libraries(ebpf_nat PRIVATE mylib)
+target_link_libraries(ebpf_nat PRIVATE mylib event)
 
 target_compile_options(ebpf_nat PRIVATE ${LIBBPF_CFLAGS})
 
