@@ -7,16 +7,12 @@
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
 #include <errno.h>
-#include <locale.h>
-#include <net/if.h>
-#include <netinet/in.h>
 #include <signal.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 #include <sys/socket.h>
-#include <time.h>
+#include <stdlib.h>
 #include <unistd.h>
+#include <net/if.h>
+#include <time.h>
 
 #define EXIT_OK          0
 #define EXIT_FAIL        1
@@ -243,7 +239,6 @@ static int stats_poll(int map_fd, __u32 map_type, int interval)
         return EXIT_FAIL;
     }
 
-    setlocale(LC_NUMERIC, "en_US");
     stats_collect(map_fd, map_type, &record);
     sleep(1);
 
@@ -456,10 +451,10 @@ int main(int argc, char **argv)
            dev_name);
 
     if ((err = update_nat_map("dnat_map", obj, "10.177.53.174", 80, IPPROTO_TCP,
-                              "172.10.1.2", 80)) < 0)
+                              "172.200.42.80", 9050)) < 0)
         goto cleanup;
 
-    if ((err = update_nat_map("snat_map", obj, "172.10.1.2", 80, IPPROTO_TCP,
+    if ((err = update_nat_map("snat_map", obj, "172.200.42.80", 9050, IPPROTO_TCP,
                               "10.177.53.174", 80)) < 0)
         goto cleanup;
 
