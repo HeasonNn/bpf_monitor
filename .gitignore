@@ -5,3 +5,4 @@ build
 env/
 rule_pb2_grpc.py
 rule_pb2.py
+.DS_Store
