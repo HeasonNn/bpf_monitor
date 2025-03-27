@@ -8,10 +8,9 @@
 typedef long long unsigned int __u64;
 
 /* This is the data record stored in the map */
-struct datarec
-{
-    __u64 rx_packets;
-    __u64 rx_bytes;
+struct datarec {
+  __u64 rx_packets;
+  __u64 rx_bytes;
 };
 
 #define XDP_UNKNOWN XDP_REDIRECT + 1

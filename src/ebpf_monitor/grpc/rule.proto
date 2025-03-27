@@ -1,0 +1,74 @@
+syntax = "proto3";
+
+package rule;
+
+// **定义 gRPC 服务**
+service RuleService {
+    rpc AddRule (RuleRequest) returns (RuleResponse);
+    rpc DeleteRule (RuleRequest) returns (RuleResponse);
+    rpc AddRuleBatch (RuleBatchRequest) returns (RuleResponse);
+    rpc DeleteRuleBatch (RuleBatchRequest) returns (RuleResponse);
+    rpc ListRules (RuleListRequest) returns (RuleListResponse);
+}
+
+// ✅ 规则类型 (对应 `rule_type_t`)
+enum RuleType {
+    RULE_IP = 0;
+    RULE_CIDR = 1;
+    RULE_PORT = 2;
+    RULE_5TUPLE = 3;
+}
+
+// ✅ 规则动作 (对应 `rule_action_t`)
+enum RuleAction {
+    ACTION_DROP = 0;
+    ACTION_ACCEPT = 1;
+}
+
+// ✅ 五元组结构 (对应 `rule_5tuple_t`)
+message FiveTuple {
+    uint32 src_ip = 1;
+    uint32 dst_ip = 2;
+    uint32 src_port = 3;
+    uint32 dst_port = 4;
+    uint32 proto = 5;
+}
+
+// ✅ CIDR 规则结构 (对应 `rule_cidr_t`)
+message Lpm {
+    uint32 prefixlen = 1;
+    uint32 ip = 2;
+}
+
+// ✅ 统一规则结构 (对应 `rule_t`)
+message RuleRequest {
+    RuleType type = 1;
+    RuleAction action = 2;
+    
+    oneof rule_data {
+        uint32 ip = 3;        // 仅适用于 RULE_IP
+        Lpm cidr = 4;         // 仅适用于 RULE_CIDR
+        uint32 port = 5;      // 仅适用于 RULE_PORT
+        FiveTuple tuple = 6;  // 仅适用于 RULE_5TUPLE
+    }
+}
+
+// ✅ 规则批量操作 (对应 `add_rule_batch_helper`)
+message RuleBatchRequest {
+    repeated RuleRequest rules = 1;
+}
+
+// ✅ 规则响应
+message RuleResponse {
+    bool success = 1;
+    string message = 2;
+}
+
+// ✅ 查询规则 (对应 `list_rules_helper`)
+message RuleListRequest {
+    RuleType type = 1;
+}
+
+message RuleListResponse {
+    repeated RuleRequest rules = 1;
+}

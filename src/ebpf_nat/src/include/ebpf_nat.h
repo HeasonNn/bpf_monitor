@@ -1,8 +1,6 @@
 #ifndef EBPF_NAT_H
 #define EBPF_NAT_H
 
-#include "../include/macros.h"
-
 #include <arpa/inet.h>
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
@@ -14,53 +12,49 @@
 #include <time.h>
 #include <unistd.h>
 
-#define DEFAULT    0
-#define SNAT       1
-#define DNAT       2
+#include "../include/macros.h"
+
+#define DEFAULT 0
+#define SNAT 1
+#define DNAT 2
 #define ACTION_MAX (DNAT + 1)
 
 #define NANOSEC_PER_SEC 1000000000
 
 #define INGRESS_HANDLE 1
-#define EGRESS_HANDLE  2
+#define EGRESS_HANDLE 2
 
-struct datarec
-{
-    __u64 rx_packets;
-    __u64 rx_bytes;
+struct datarec {
+  __u64 rx_packets;
+  __u64 rx_bytes;
 } __attribute__((aligned(8)));
 
-struct nat_key_t
-{
-    __u32 ip;
-    __u16 port;
-    __u8 protocol;
+struct nat_key_t {
+  __u32 ip;
+  __u16 port;
+  __u8 protocol;
 } __attribute__((packed));
 
-struct nat_value_t
-{
-    __u32 ip;
-    __u16 port;
+struct nat_value_t {
+  __u32 ip;
+  __u16 port;
 } __attribute__((aligned(2)));
 
-struct record
-{
-    __u64 timestamp;
-    struct datarec total;
+struct record {
+  __u64 timestamp;
+  struct datarec total;
 };
 
-struct stats_record
-{
-    struct record stats[ACTION_MAX];
+struct stats_record {
+  struct record stats[ACTION_MAX];
 };
 
-typedef struct
-{
-    struct stats_record prev;
-    struct stats_record record;
-    int map_fd;
-    __u32 map_type;
-    int initialized;
+typedef struct {
+  struct stats_record prev;
+  struct stats_record record;
+  int map_fd;
+  __u32 map_type;
+  int initialized;
 } stats_context_t;
 
 extern volatile sig_atomic_t exiting;
